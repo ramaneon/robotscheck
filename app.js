@@ -6,66 +6,87 @@ let S = {
   raw: '',
   rules: [],
   sitemaps: [],
-  disAllAgents: [],
-  selAgent: '*',
-  selectedDis: new Set(),
-  extractedUrls: [],
-  filteredSmUrls: [],
-  selectedSm: new Set(),
+  extractedSitemapUrls: [],
+  currentTab: 'disallow', // 'disallow' | 'allow' | 'sitemap' | 'combined'
+  selected: new Set(),
   aborted: false,
   isEditing: false,
   batchResults: [],
-  probeStatus: {}
+  probeStatus: {} // url -> 'live' | 200 | 403 | 404 | 'err'
 };
 
-// ── MULTI-TIER RESILIENT PROXY ENGINE ──
+// ── FAST PARALLEL MULTI-TIER PROXY FETCHER (Promise.any) ──
 async function fetchText(url) {
-  // 1. Primary: Jina AI reader proxy (bypasses Cloudflare WAF, returns clean plain text)
-  try {
-    const jinaUrl = 'https://r.jina.ai/' + url;
-    const r = await fetch(jinaUrl, {
-      headers: { 'Accept': 'text/plain' },
-      signal: AbortSignal.timeout(7000)
-    });
-    if (r.ok) {
+  const sources = [
+    // Source 1: Jina reader proxy (bypasses Cloudflare WAF, plain text)
+    (async () => {
+      const r = await fetch('https://r.jina.ai/' + url, {
+        headers: { 'Accept': 'text/plain' },
+        signal: AbortSignal.timeout(6500)
+      });
+      if (!r.ok) throw new Error('Jina status ' + r.status);
       let t = await r.text();
       if (t.includes('Markdown Content:')) {
         t = t.split('Markdown Content:')[1].trim();
       }
       t = cleanFetchedText(t);
-      if (isLikelyValidContent(t)) return { ok: true, text: t };
-    }
-  } catch (e) {}
+      if (!isLikelyValidContent(t)) throw new Error('Invalid content');
+      return t;
+    })(),
 
-  // 2. Direct fetch (if same-origin or CORS permissive)
-  try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(3000) });
-    if (r.ok) {
+    // Source 2: Direct fetch (for permissive/same-origin targets)
+    (async () => {
+      const r = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (!r.ok) throw new Error('Direct status ' + r.status);
       const t = await r.text();
-      if (t && t.length > 5) return { ok: true, text: t.trim() };
-    }
-  } catch (e) {}
+      if (!t || t.length < 5) throw new Error('Empty');
+      return t.trim();
+    })(),
 
-  // 3. Fallback public CORS proxies
-  const fallbacks = [
-    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-    u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`
+    // Source 3: Codetabs CORS proxy
+    (async () => {
+      const r = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!r.ok) throw new Error('Codetabs status ' + r.status);
+      const t = await r.text();
+      const cleaned = cleanFetchedText(t);
+      if (!isLikelyValidContent(cleaned)) throw new Error('Invalid');
+      return cleaned;
+    })(),
+
+    // Source 4: Corsproxy.io
+    (async () => {
+      const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!r.ok) throw new Error('Corsproxy status ' + r.status);
+      const t = await r.text();
+      const cleaned = cleanFetchedText(t);
+      if (!isLikelyValidContent(cleaned)) throw new Error('Invalid');
+      return cleaned;
+    })(),
+
+    // Source 5: AllOrigins
+    (async () => {
+      const r = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, {
+        signal: AbortSignal.timeout(6000)
+      });
+      if (!r.ok) throw new Error('Allorigins status ' + r.status);
+      const t = await r.text();
+      const cleaned = cleanFetchedText(t);
+      if (!isLikelyValidContent(cleaned)) throw new Error('Invalid');
+      return cleaned;
+    })()
   ];
 
-  for (const proxyFn of fallbacks) {
-    try {
-      const pUrl = proxyFn(url);
-      const r = await fetch(pUrl, { signal: AbortSignal.timeout(5000) });
-      if (r.ok) {
-        const t = await r.text();
-        const cleaned = cleanFetchedText(t);
-        if (cleaned && cleaned.length > 5) return { ok: true, text: cleaned };
-      }
-    } catch (e) {}
+  try {
+    const text = await Promise.any(sources);
+    return { ok: true, text };
+  } catch (err) {
+    console.warn('All parallel proxies failed for', url, err);
+    return { ok: false, text: '' };
   }
-
-  return { ok: false, text: '' };
 }
 
 function cleanFetchedText(txt) {
@@ -78,10 +99,10 @@ function cleanFetchedText(txt) {
 function isLikelyValidContent(txt) {
   if (!txt) return false;
   const lo = txt.toLowerCase();
-  return lo.includes('user-agent') || lo.includes('disallow') || lo.includes('sitemap') || lo.includes('<urlset') || lo.includes('<sitemapindex') || lo.includes('http') || txt.length > 15;
+  return lo.includes('user-agent') || lo.includes('disallow') || lo.includes('allow') || lo.includes('sitemap') || lo.includes('<urlset') || lo.includes('<sitemapindex') || lo.includes('http') || txt.length > 20;
 }
 
-// ── ROBOTS.TXT PARSER (RFC 9309 & Google Robots Spec Compliant) ──
+// ── ROBOTS.TXT DIRECTIVE PARSER ──
 function parseRobots(txt) {
   const lines = txt.split(/\r?\n/);
   const rules = [];
@@ -125,13 +146,12 @@ function highlightRobots(txt) {
     .replace(/^(Sitemap:)(.*)$/gim, '<span class="r-sm">$1</span>$2');
 }
 
-// ── URL NORMALIZATION & RESOLUTION ──
+// ── URL NORMALIZATION (No double slashes, strips wildcard prefixes) ──
 function normalizeBase(raw) {
   let u = (raw || '').trim();
   if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
   try {
-    const parsed = new URL(u);
-    return parsed.origin;
+    return new URL(u).origin;
   } catch {
     return u.replace(/\/+$/, '');
   }
@@ -206,7 +226,7 @@ function checkUrlAgainst(testPath, agentFilter = '*') {
   }
 }
 
-// ── MAIN SCAN FLOW ──
+// ── MAIN SCAN PIPELINE ──
 async function go() {
   const inputEl = document.getElementById('inp');
   let raw = inputEl.value.trim();
@@ -217,12 +237,8 @@ async function go() {
   S.raw = '';
   S.rules = [];
   S.sitemaps = [];
-  S.disAllAgents = [];
-  S.selAgent = '*';
-  S.selectedDis.clear();
-  S.extractedUrls = [];
-  S.filteredSmUrls = [];
-  S.selectedSm.clear();
+  S.extractedSitemapUrls = [];
+  S.selected.clear();
   S.aborted = false;
   S.probeStatus = {};
 
@@ -232,41 +248,50 @@ async function go() {
 
   show('statusBar');
   hide('results');
-  setStatus(`Probing ${base}/robots.txt...`, 20);
+  clearLiveLog();
+  logLive('Target normalized: ' + base);
+  setStatus(`Fetching ${base}/robots.txt...`, 20);
 
   const robotsUrl = `${base}/robots.txt`;
+  logLive('Requesting ' + robotsUrl + ' via parallel multi-tier proxies...');
   const res = await fetchText(robotsUrl);
 
   if (res.ok && res.text) {
     S.raw = res.text;
     S.rules = parseRobots(res.text);
     S.sitemaps = S.rules.filter(r => r.type === 'sitemap').map(r => r.path);
-    setStatus('Parsing directives & sitemaps...', 60);
+
+    const disCount = S.rules.filter(r => r.type === 'dis').length;
+    const allCount = S.rules.filter(r => r.type === 'all').length;
+    logLive(`✓ robots.txt parsed! Found ${disCount} Disallow rules, ${allCount} Allow rules, ${S.sitemaps.length} Sitemaps`);
+    setStatus('Directives loaded. Checking sitemaps...', 55);
   } else {
     S.raw = '';
-    toast('Direct robots.txt probe failed. Try editing or pasting directly.', 'warn');
+    logLive('⚠ Direct fetch failed. You can paste rules manually.');
+    toast('robots.txt fetch failed. Try pasting directly if target has strong blocking.', 'warn');
   }
 
-  // Check default sitemaps
+  // Ensure default sitemaps checked
   const defaultSMs = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'];
   for (const sm of defaultSMs) {
     const full = base + sm;
     if (!S.sitemaps.includes(full)) S.sitemaps.push(full);
   }
 
-  setStatus('Recon finished!', 100);
+  setStatus('Recon ready! Crawling sitemap XML...', 80);
+  renderAll();
 
-  setTimeout(() => {
-    hide('statusBar');
-    renderAll();
-    btn.textContent = 'FETCH & SCAN';
-    btn.classList.remove('active');
+  // Auto crawl sitemaps in background
+  if (S.sitemaps.length) {
+    logLive('Crawling XML sitemaps for page URLs in real time...');
+    crawlAllSitemaps(true);
+  } else {
+    setStatus('Done!', 100);
+    setTimeout(() => hide('statusBar'), 1200);
+  }
 
-    // Auto-crawl sitemaps in background for seamless UX
-    if (S.sitemaps.length) {
-      crawlAllSitemaps(true);
-    }
-  }, 350);
+  btn.textContent = 'FETCH & SCAN';
+  btn.classList.remove('active');
 }
 
 function qs(d) {
@@ -274,7 +299,23 @@ function qs(d) {
   go();
 }
 
-// ── MANUAL PASTE / EDIT ROBOTS.TXT ──
+// ── LIVE STREAMING LOG ──
+function logLive(msg) {
+  const feed = document.getElementById('liveFeedLog');
+  if (!feed) return;
+  const line = document.createElement('div');
+  line.className = 'live-log-line';
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  feed.appendChild(line);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function clearLiveLog() {
+  const feed = document.getElementById('liveFeedLog');
+  if (feed) feed.innerHTML = '';
+}
+
+// ── MANUAL PASTE / EDIT ──
 function toggleManualInput() {
   const mb = document.getElementById('manualBox');
   mb.classList.toggle('hidden');
@@ -297,13 +338,13 @@ function parseManual() {
   S.rules = parseRobots(txt);
   S.sitemaps = S.rules.filter(r => r.type === 'sitemap').map(r => r.path);
   if (!S.sitemaps.length) S.sitemaps.push(S.base + '/sitemap.xml');
-  S.selectedDis.clear();
-  S.extractedUrls = [];
+  S.selected.clear();
+  S.extractedSitemapUrls = [];
   S.probeStatus = {};
 
   toggleManualInput();
   renderAll();
-  toast('Custom robots.txt loaded and parsed!', 'ok');
+  toast('Custom robots.txt parsed successfully!', 'ok');
 }
 
 // ── IN-CARD LIVE EDITOR ──
@@ -332,7 +373,7 @@ function applyEditorChanges() {
   S.sitemaps = S.rules.filter(r => r.type === 'sitemap').map(r => r.path);
   toggleEditMode();
   renderAll();
-  toast('Updated rules applied!', 'ok');
+  toast('Updated directives applied!', 'ok');
 }
 
 // ── RENDER ENGINE ──
@@ -340,12 +381,9 @@ function renderAll() {
   renderStats();
   renderRaw();
   renderSitemaps();
-  renderDisallowed();
+  renderCurrentList();
   populateAgentSelect();
   show('results');
-  document.getElementById('results').scrollIntoView({ behavior: 'smooth' });
-  const disCount = S.rules.filter(r => r.type === 'dis').length;
-  toast(`Recon ready: ${disCount} Disallowed endpoints extracted`, 'ok');
 }
 
 function renderStats() {
@@ -353,12 +391,17 @@ function renderStats() {
   const all = S.rules.filter(r => r.type === 'all');
   const agents = [...new Set(S.rules.map(r => r.agent))];
 
+  document.getElementById('countDis').textContent = dis.length;
+  document.getElementById('countAll').textContent = all.length;
+  document.getElementById('countSm').textContent = S.extractedSitemapUrls.length;
+  document.getElementById('countCombined').textContent = dis.length + all.length + S.extractedSitemapUrls.length;
+
   const data = [
     { n: dis.length, l: 'Disallowed Endpoints', c: '#ff4757' },
-    { n: all.length, l: 'Allowed Rules', c: '#00f5a0' },
-    { n: S.sitemaps.length, l: 'Sitemaps', c: '#00d9f5' },
+    { n: all.length, l: 'Allowed Endpoints', c: '#00f5a0' },
+    { n: S.sitemaps.length, l: 'Sitemap Files', c: '#00d9f5' },
+    { n: S.extractedSitemapUrls.length, l: 'Sitemap URLs', c: '#ff9ff3' },
     { n: agents.length, l: 'User Agents', c: '#ffd700' },
-    { n: S.extractedUrls.length, l: 'Sitemap URLs', c: '#ff9ff3' },
     { n: S.rules.length, l: 'Total Directives', c: '#7a9db0' },
   ];
 
@@ -414,18 +457,17 @@ function renderSitemaps() {
   `).join('');
 }
 
-// ── RECURSIVE SITEMAP XML CRAWLER & URL EXTRACTOR ──
+// ── RECURSIVE SITEMAP XML CRAWLER ──
 async function crawlAllSitemaps(isAuto = false) {
   if (!S.sitemaps.length) return;
   const btn = document.getElementById('crawlSitemapBtn');
   if (btn) btn.textContent = 'Crawling...';
-  if (!isAuto) toast('Crawling sitemaps and sub-sitemaps for page URLs...', 'ok');
+  if (!isAuto) toast('Crawling XML sitemaps for page URLs...', 'ok');
 
   const gathered = new Set();
   const subSitemaps = new Set();
   const baseHost = new URL(S.base).hostname;
 
-  // 1. Fetch main sitemaps to locate URLs and sub-sitemaps (e.g. blog-0.xml, static-0.xml)
   for (const smUrl of S.sitemaps.slice(0, 4)) {
     try {
       const res = await fetchText(smUrl);
@@ -433,21 +475,18 @@ async function crawlAllSitemaps(isAuto = false) {
         const rawUrls = res.text.match(/https?:\/\/[a-zA-Z0-9\.\-_/]+/g) || [];
         rawUrls.forEach(u => {
           if (u.includes(baseHost)) {
-            if (u.endsWith('.xml')) {
-              subSitemaps.add(u);
-            } else if (!isStaticAsset(u)) {
-              gathered.add(u);
-            }
+            if (u.endsWith('.xml')) subSitemaps.add(u);
+            else if (!isStaticAsset(u)) gathered.add(u);
           }
         });
       }
     } catch (e) {}
   }
 
-  // 2. Fetch sub-sitemaps found in sitemap indexes
-  const subList = Array.from(subSitemaps).slice(0, 5);
-  for (const sub of subList) {
+  // Crawl sub-sitemaps (e.g. blog-0.xml, static-0.xml)
+  for (const sub of Array.from(subSitemaps).slice(0, 6)) {
     try {
+      logLive('Crawling sub-sitemap: ' + sub);
       const res = await fetchText(sub);
       if (res.ok && res.text) {
         const rawUrls = res.text.match(/https?:\/\/[a-zA-Z0-9\.\-_/]+/g) || [];
@@ -460,15 +499,19 @@ async function crawlAllSitemaps(isAuto = false) {
     } catch (e) {}
   }
 
-  if (btn) btn.textContent = '⚡ Crawl & Extract URLs';
-  S.extractedUrls = Array.from(gathered);
-  S.filteredSmUrls = [...S.extractedUrls];
+  if (btn) btn.textContent = '⚡ Crawl XML URLs';
+  S.extractedSitemapUrls = Array.from(gathered);
+  logLive(`✓ Sitemap crawl finished: Extracted ${S.extractedSitemapUrls.length} page URLs`);
+  setStatus('All URLs extracted!', 100);
+  setTimeout(() => hide('statusBar'), 1500);
 
-  renderSitemapExplorer();
   renderStats();
+  if (S.currentTab === 'sitemap' || S.currentTab === 'combined') {
+    renderCurrentList();
+  }
 
-  if (S.extractedUrls.length) {
-    toast(`Extracted ${S.extractedUrls.length} page URLs from Sitemap XML!`, 'ok');
+  if (S.extractedSitemapUrls.length) {
+    toast(`Extracted ${S.extractedSitemapUrls.length} URLs from XML Sitemaps!`, 'ok');
   }
 }
 
@@ -476,210 +519,146 @@ function isStaticAsset(url) {
   return /\.(svg|webp|png|jpg|jpeg|gif|css|js|ico|woff|woff2|ttf|eot)(\?.*)?$/i.test(url);
 }
 
-function renderSitemapExplorer() {
-  const badge = document.getElementById('smTotalBadge');
-  const countEl = document.getElementById('smFilteredCount');
-  const listEl = document.getElementById('sitemapUrlsList');
+// ── TAB SWITCHING & LIST RENDERING ──
+function switchTab(tabName) {
+  S.currentTab = tabName;
+  document.querySelectorAll('.cat-tab').forEach(b => b.classList.remove('active'));
+  if (tabName === 'disallow') document.getElementById('tabDisallow').classList.add('active');
+  if (tabName === 'allow') document.getElementById('tabAllow').classList.add('active');
+  if (tabName === 'sitemap') document.getElementById('tabSitemap').classList.add('active');
+  if (tabName === 'combined') document.getElementById('tabCombined').classList.add('active');
 
-  badge.textContent = `${S.extractedUrls.length} URLs Extracted`;
-  countEl.textContent = `${S.filteredSmUrls.length} matching URLs`;
+  S.selected.clear();
+  renderCurrentList();
+}
 
-  if (!S.filteredSmUrls.length) {
-    listEl.innerHTML = '<span class="muted">No matching sitemap URLs found.</span>';
-    return;
+function getActiveListItems() {
+  const query = (document.getElementById('urlFilterInput')?.value || '').trim().toLowerCase();
+
+  let items = [];
+  if (S.currentTab === 'disallow') {
+    items = S.rules.filter(r => r.type === 'dis').map(r => ({
+      type: 'disallow',
+      path: r.path,
+      agent: r.agent,
+      fullUrl: resolveEndpointUrl(S.base, r.path)
+    }));
+  } else if (S.currentTab === 'allow') {
+    items = S.rules.filter(r => r.type === 'all').map(r => ({
+      type: 'allow',
+      path: r.path,
+      agent: r.agent,
+      fullUrl: resolveEndpointUrl(S.base, r.path)
+    }));
+  } else if (S.currentTab === 'sitemap') {
+    items = S.extractedSitemapUrls.map(u => ({
+      type: 'sitemap',
+      path: u.replace(S.base, '') || '/',
+      agent: '*',
+      fullUrl: u
+    }));
+  } else if (S.currentTab === 'combined') {
+    const dis = S.rules.filter(r => r.type === 'dis').map(r => ({
+      type: 'disallow', path: r.path, agent: r.agent, fullUrl: resolveEndpointUrl(S.base, r.path)
+    }));
+    const all = S.rules.filter(r => r.type === 'all').map(r => ({
+      type: 'allow', path: r.path, agent: r.agent, fullUrl: resolveEndpointUrl(S.base, r.path)
+    }));
+    const sm = S.extractedSitemapUrls.map(u => ({
+      type: 'sitemap', path: u.replace(S.base, '') || '/', agent: '*', fullUrl: u
+    }));
+    items = [...dis, ...all, ...sm];
   }
 
-  // Render items (capped at first 100 for instant UI rendering, with pagination notice)
-  const displaySlice = S.filteredSmUrls.slice(0, 100);
-  listEl.innerHTML = displaySlice.map((u, i) => {
-    const sel = S.selectedSm.has(u);
-    const probe = S.probeStatus[u];
-    let probeHtml = '';
-    if (probe === 200 || probe === 'live') {
-      probeHtml = '<span class="probe-tag probe-live">200 OK</span>';
-    } else if (probe && probe !== 'err') {
-      probeHtml = `<span class="probe-tag probe-info">${probe}</span>`;
-    } else if (probe === 'err') {
-      probeHtml = '<span class="probe-tag probe-err">ERR</span>';
-    }
-
-    return `
-      <div class="dis-item${sel ? ' selected' : ''}" data-url="${esc(u)}" style="animation:fadeUp .2s ${Math.min(i * 0.01, 0.3)}s ease backwards" onclick="toggleSelSm('${esc(u)}',event)">
-        <div class="dis-chk${sel ? ' checked' : ''}" onclick="toggleSelSm('${esc(u)}',event)"></div>
-        <div class="dis-info">
-          <div class="dis-rule-line">
-            <span class="sm-url-text">${esc(u)}</span>
-            ${probeHtml}
-          </div>
-        </div>
-        <div class="dis-btns">
-          <button class="dis-btn" onclick="event.stopPropagation();probeUrl('${esc(u)}')" title="Probe Status">⚡</button>
-          <button class="dis-btn" onclick="event.stopPropagation();window.open('${esc(u)}','_blank')" title="Open in browser">&#x1F517;</button>
-          <button class="dis-btn" onclick="event.stopPropagation();copyT('${esc(u)}')" title="Copy URL">&#x1F4CB;</button>
-        </div>
-      </div>
-    `;
-  }).join('') + (S.filteredSmUrls.length > 100 ? `<div style="text-align:center;padding:12px;font-family:var(--mono);font-size:12px;color:var(--txt3);">Showing first 100 of ${S.filteredSmUrls.length} URLs (use search bar above to filter)</div>` : '');
-}
-
-function filterSitemapUrls() {
-  const q = document.getElementById('smSearchInput').value.trim().toLowerCase();
-  if (!q) {
-    S.filteredSmUrls = [...S.extractedUrls];
-  } else {
-    S.filteredSmUrls = S.extractedUrls.filter(u => u.toLowerCase().includes(q));
+  if (query) {
+    items = items.filter(it => it.fullUrl.toLowerCase().includes(query) || it.path.toLowerCase().includes(query));
   }
-  renderSitemapExplorer();
+
+  return items;
 }
 
-function toggleSelSm(url, e) {
-  if (e.target.classList.contains('dis-btn')) return;
-  if (S.selectedSm.has(url)) S.selectedSm.delete(url);
-  else S.selectedSm.add(url);
-  renderSitemapExplorer();
-}
+function renderCurrentList() {
+  const listEl = document.getElementById('endpointsList');
+  const countBadge = document.getElementById('activeCountBadge');
+  const items = getActiveListItems();
 
-function selectAllSitemapUrls() {
-  S.filteredSmUrls.forEach(u => S.selectedSm.add(u));
-  renderSitemapExplorer();
-}
+  countBadge.textContent = items.length + ' URLs';
+  if (S.currentTab === 'disallow') countBadge.className = 'badge-pill red-pill';
+  else if (S.currentTab === 'allow') countBadge.className = 'badge-pill green-pill';
+  else if (S.currentTab === 'sitemap') countBadge.className = 'badge-pill cyan-pill';
+  else countBadge.className = 'badge-pill purple-pill';
 
-function clearSelSitemapUrls() {
-  S.selectedSm.clear();
-  renderSitemapExplorer();
-}
-
-function openSelectedSitemapUrls() {
-  if (!S.selectedSm.size) { toast('No sitemap URLs selected', 'warn'); return; }
-  const urls = Array.from(S.selectedSm);
-  if (urls.length > 30) {
-    if (!confirm(`Open ${urls.length} tabs in browser?`)) return;
-  }
-  const delay = getDelay();
-  urls.forEach((u, i) => setTimeout(() => window.open(u, '_blank'), i * delay));
-  toast(`Opening ${urls.length} selected sitemap URLs!`, 'ok');
-}
-
-function openAllSitemapUrls() {
-  const targetList = S.filteredSmUrls.length ? S.filteredSmUrls : S.extractedUrls;
-  if (!targetList.length) { toast('No extracted sitemap URLs to open', 'warn'); return; }
-  const limit = Math.min(targetList.length, 30);
-  if (!confirm(`Open first ${limit} sitemap URLs in tabs?`)) return;
-
-  const delay = getDelay();
-  targetList.slice(0, limit).forEach((u, i) => {
-    setTimeout(() => window.open(u, '_blank'), i * delay);
-  });
-  toast(`Opening ${limit} sitemap URLs in browser tabs!`, 'ok');
-}
-
-function copyAllSitemapUrls() {
-  const list = S.filteredSmUrls.length ? S.filteredSmUrls : S.extractedUrls;
-  if (!list.length) { toast('No sitemap URLs to copy', 'warn'); return; }
-  navigator.clipboard.writeText(list.join('\n')).then(() => {
-    toast(`Copied ${list.length} sitemap URLs!`, 'ok');
-  });
-}
-
-// ── DISALLOWED ENDPOINTS RENDERING ──
-function renderDisallowed() {
-  const dis = S.rules.filter(r => r.type === 'dis');
-  const badge = document.getElementById('disBadge');
-  badge.textContent = dis.length + ' paths';
-
-  const rawAgents = dis.map(r => r.agent);
-  const agents = ['*', ...new Set(rawAgents.filter(a => a !== '*'))];
-  S.disAllAgents = agents;
-
-  const ab = document.getElementById('agentBtns');
-  ab.innerHTML = agents.map(a => `
-    <button class="agent-btn${a === S.selAgent ? ' active' : ''}" onclick="setAgent('${esc(a)}')">${esc(a)}</button>
-  `).join('');
-
-  renderDisList();
-}
-
-function renderDisList() {
-  const dis = S.rules.filter(r => r.type === 'dis' && (S.selAgent === '*' || r.agent === S.selAgent || r.agent === '*'));
-  const list = document.getElementById('disList');
-
-  if (!dis.length) {
-    list.innerHTML = '<span class="muted">No disallowed paths for this agent</span>';
+  if (!items.length) {
+    listEl.innerHTML = '<span class="muted">No endpoints found in this category.</span>';
     document.getElementById('batchBar').classList.add('hidden');
     return;
   }
 
-  list.innerHTML = dis.map((d, i) => {
-    const full = resolveEndpointUrl(S.base, d.path);
-    const sel = S.selectedDis.has(full);
-    const probe = S.probeStatus[full];
+  // Display items (slice up to 100 for instant UI rendering)
+  const displaySlice = items.slice(0, 100);
+  listEl.innerHTML = displaySlice.map((it, i) => {
+    const sel = S.selected.has(it.fullUrl);
+    const probe = S.probeStatus[it.fullUrl];
 
-    let probeHtml = '';
+    let probeBadge = '';
     if (probe === 200 || probe === 'live') {
-      probeHtml = '<span class="probe-tag probe-live">200 OK</span>';
+      probeBadge = '<span class="probe-tag probe-live">200 OK</span>';
     } else if (probe && probe !== 'err') {
-      probeHtml = `<span class="probe-tag probe-info">${probe}</span>`;
+      probeBadge = `<span class="probe-tag probe-info">${probe}</span>`;
     } else if (probe === 'err') {
-      probeHtml = '<span class="probe-tag probe-err">ERR</span>';
+      probeBadge = '<span class="probe-tag probe-err">ERR</span>';
     }
 
+    let typeTag = '';
+    if (it.type === 'disallow') typeTag = '<span class="cat-pill c-dis">DISALLOW</span>';
+    else if (it.type === 'allow') typeTag = '<span class="cat-pill c-all">ALLOW</span>';
+    else typeTag = '<span class="cat-pill c-sm">SITEMAP</span>';
+
     return `
-      <div class="dis-item${sel ? ' selected' : ''}" data-url="${esc(full)}" style="animation:fadeUp .25s ${Math.min(i * 0.015, 0.4)}s ease backwards" onclick="toggleSelDis('${esc(full)}',event)">
-        <div class="dis-chk${sel ? ' checked' : ''}" onclick="toggleSelDis('${esc(full)}',event)"></div>
+      <div class="dis-item${sel ? ' selected' : ''}" data-url="${esc(it.fullUrl)}" style="animation:fadeUp .2s ${Math.min(i * 0.01, 0.3)}s ease backwards" onclick="toggleItemSel('${esc(it.fullUrl)}',event)">
+        <div class="dis-chk${sel ? ' checked' : ''}" onclick="toggleItemSel('${esc(it.fullUrl)}',event)"></div>
         <div class="dis-info">
           <div class="dis-rule-line">
-            <span class="dis-path">${esc(d.path)}</span>
-            <span class="dis-agent">${esc(d.agent)}</span>
-            ${probeHtml}
+            ${typeTag}
+            <span class="dis-path">${esc(it.path)}</span>
+            <span class="dis-agent">${esc(it.agent)}</span>
+            ${probeBadge}
           </div>
-          <div class="dis-full-url" title="Full Target URL">${esc(full)}</div>
+          <div class="dis-full-url" title="Full Target URL">${esc(it.fullUrl)}</div>
         </div>
         <div class="dis-btns">
-          <button class="dis-btn" onclick="event.stopPropagation();probeUrl('${esc(full)}')" title="Probe Status">⚡</button>
-          <button class="dis-btn" onclick="event.stopPropagation();window.open('${esc(full)}','_blank')" title="Open in browser">&#x1F517;</button>
-          <button class="dis-btn" onclick="event.stopPropagation();copyT('${esc(full)}')" title="Copy URL">&#x1F4CB;</button>
+          <button class="dis-btn" onclick="event.stopPropagation();probeUrl('${esc(it.fullUrl)}')" title="Probe Status">⚡</button>
+          <button class="dis-btn" onclick="event.stopPropagation();window.open('${esc(it.fullUrl)}','_blank')" title="Open in new tab">&#x1F517;</button>
+          <button class="dis-btn" onclick="event.stopPropagation();copyT('${esc(it.fullUrl)}')" title="Copy URL">&#x1F4CB;</button>
         </div>
       </div>
     `;
-  }).join('');
+  }).join('') + (items.length > 100 ? `<div style="text-align:center;padding:12px;font-family:var(--mono);font-size:12px;color:var(--txt3);">Showing first 100 of ${items.length} URLs (filter above to narrow down)</div>` : '');
 
   document.getElementById('batchBar').classList.remove('hidden');
-  updateSelCountDis();
+  updateSelCount();
 }
 
-function setAgent(a) {
-  S.selAgent = a;
-  document.querySelectorAll('.agent-btn').forEach(b => {
-    b.classList.toggle('active', b.textContent === a);
-  });
-  S.selectedDis.clear();
-  renderDisList();
-}
-
-function toggleSelDis(url, e) {
+function toggleItemSel(url, e) {
   if (e.target.classList.contains('dis-btn')) return;
-  if (S.selectedDis.has(url)) S.selectedDis.delete(url);
-  else S.selectedDis.add(url);
-  const item = document.querySelector(`.dis-item[data-url="${url}"]`);
-  const chk = item?.querySelector('.dis-chk');
-  if (item) item.classList.toggle('selected');
-  if (chk) chk.classList.toggle('checked');
-  updateSelCountDis();
+  if (S.selected.has(url)) S.selected.delete(url);
+  else S.selected.add(url);
+  renderCurrentList();
 }
 
-function updateSelCountDis() {
-  document.getElementById('selCount').textContent = S.selectedDis.size + ' selected';
+function updateSelCount() {
+  document.getElementById('selCount').textContent = S.selected.size + ' selected';
 }
 
-function selectAllDis() {
-  const dis = S.rules.filter(r => r.type === 'dis' && (S.selAgent === '*' || r.agent === S.selAgent || r.agent === '*'));
-  dis.forEach(d => S.selectedDis.add(resolveEndpointUrl(S.base, d.path)));
-  renderDisList();
+function selectAllUrls() {
+  const items = getActiveListItems();
+  items.forEach(it => S.selected.add(it.fullUrl));
+  renderCurrentList();
 }
 
-function clearSelDis() {
-  S.selectedDis.clear();
-  renderDisList();
+function clearSelUrls() {
+  S.selected.clear();
+  renderCurrentList();
 }
 
 function getDelay() {
@@ -688,31 +667,32 @@ function getDelay() {
 }
 
 // ── 1-CLICK TAB OPENERS ──
-function openAllDis() {
-  const dis = S.rules.filter(r => r.type === 'dis' && (S.selAgent === '*' || r.agent === S.selAgent || r.agent === '*'));
-  const urls = [...new Set(dis.map(d => resolveEndpointUrl(S.base, d.path)))];
+function openAllActiveTab() {
+  const items = getActiveListItems();
+  const urls = [...new Set(items.map(it => it.fullUrl))];
+  if (!urls.length) { toast('No URLs in current category to open', 'warn'); return; }
 
-  if (!urls.length) { toast('No disallowed endpoints to open', 'warn'); return; }
-  if (urls.length > 25) {
-    if (!confirm(`Open ${urls.length} tabs in your browser?`)) return;
-  }
+  const limit = Math.min(urls.length, 30);
+  if (!confirm(`Open ${limit} tabs in your browser?`)) return;
 
   const delay = getDelay();
-  urls.forEach((u, i) => {
+  urls.slice(0, limit).forEach((u, i) => {
     setTimeout(() => window.open(u, '_blank'), i * delay);
   });
-  toast(`Opening ${urls.length} disallowed endpoints in tabs!`, 'ok');
+  toast(`Opening ${limit} tabs!`, 'ok');
 }
 
-function openSelectedDis() {
-  if (!S.selectedDis.size) { toast('No endpoints selected', 'warn'); return; }
-  const urls = Array.from(S.selectedDis);
-  if (urls.length > 25) {
-    if (!confirm(`Open ${urls.length} selected tabs?`)) return;
-  }
+function openSelectedUrls() {
+  if (!S.selected.size) { toast('No URLs selected', 'warn'); return; }
+  const urls = Array.from(S.selected);
+  const limit = Math.min(urls.length, 30);
+  if (!confirm(`Open ${limit} selected tabs?`)) return;
+
   const delay = getDelay();
-  urls.forEach((u, i) => setTimeout(() => window.open(u, '_blank'), i * delay));
-  toast(`Opening ${urls.length} selected tabs!`, 'ok');
+  urls.slice(0, limit).forEach((u, i) => {
+    setTimeout(() => window.open(u, '_blank'), i * delay);
+  });
+  toast(`Opening ${limit} selected tabs!`, 'ok');
 }
 
 function openAllSitemaps() {
@@ -724,86 +704,70 @@ function openAllSitemaps() {
   toast(`Opening ${S.sitemaps.length} sitemaps!`, 'ok');
 }
 
-// ── HIGH-RELIABILITY LIVE PROBING ──
+function copyActiveTab() {
+  const items = getActiveListItems();
+  const urls = [...new Set(items.map(it => it.fullUrl))];
+  if (!urls.length) { toast('No URLs to copy', 'warn'); return; }
+  navigator.clipboard.writeText(urls.join('\n')).then(() => {
+    toast(`Copied ${urls.length} URLs!`, 'ok');
+  });
+}
+
+// ── HIGH-RELIABILITY LIVE STATUS PROBER ──
 async function probeUrl(url) {
   toast(`Probing ${url}...`, 'ok');
   try {
-    // 1. Fast direct probe
-    const r = await fetch(url, { mode: 'no-cors', signal: AbortSignal.timeout(3500) });
+    const r = await fetch(url, { mode: 'no-cors', signal: AbortSignal.timeout(3000) });
     S.probeStatus[url] = 'live';
   } catch (e) {
-    // 2. Fallback check via Jina proxy to get real status
     try {
-      const pr = await fetch(`https://r.jina.ai/${url}`, { signal: AbortSignal.timeout(4500) });
+      const pr = await fetch(`https://r.jina.ai/${url}`, { signal: AbortSignal.timeout(4000) });
       if (pr.ok) S.probeStatus[url] = 200;
       else S.probeStatus[url] = pr.status;
     } catch {
       S.probeStatus[url] = 'err';
     }
   }
-  renderDisList();
-  renderSitemapExplorer();
+  renderCurrentList();
 }
 
-async function probeAllDis() {
-  const dis = S.rules.filter(r => r.type === 'dis' && (S.selAgent === '*' || r.agent === S.selAgent || r.agent === '*'));
-  const urls = [...new Set(dis.map(d => resolveEndpointUrl(S.base, d.path)))];
+async function probeActiveTab() {
+  const items = getActiveListItems();
+  const urls = [...new Set(items.map(it => it.fullUrl))].slice(0, 30);
   if (!urls.length) return;
 
-  const btn = document.getElementById('probeDisBtn');
+  const btn = document.getElementById('probeActiveBtn');
   btn.textContent = 'Probing...';
-  toast(`Probing ${urls.length} endpoints...`, 'ok');
+  toast(`Probing first ${urls.length} endpoints...`, 'ok');
 
   for (const u of urls) {
-    try {
-      await fetch(u, { mode: 'no-cors', signal: AbortSignal.timeout(2500) });
-      S.probeStatus[u] = 'live';
-    } catch {
-      S.probeStatus[u] = 'err';
-    }
-    renderDisList();
-  }
-
-  btn.textContent = '⚡ Probe Live Status';
-  toast('Disallowed endpoints probed!', 'ok');
-}
-
-async function probeSelectedDis() {
-  if (!S.selectedDis.size) return;
-  const urls = Array.from(S.selectedDis);
-  toast(`Probing ${urls.length} selected endpoints...`, 'ok');
-  for (const u of urls) {
-    try {
-      await fetch(u, { mode: 'no-cors', signal: AbortSignal.timeout(2500) });
-      S.probeStatus[u] = 'live';
-    } catch {
-      S.probeStatus[u] = 'err';
-    }
-  }
-  renderDisList();
-  toast('Selected endpoints probed!', 'ok');
-}
-
-async function probeAllSitemapUrls() {
-  const list = S.filteredSmUrls.slice(0, 30);
-  if (!list.length) return;
-
-  const btn = document.getElementById('probeAllSmBtn');
-  btn.textContent = 'Probing...';
-  toast(`Probing first ${list.length} sitemap URLs...`, 'ok');
-
-  for (const u of list) {
     try {
       await fetch(u, { mode: 'no-cors', signal: AbortSignal.timeout(2000) });
       S.probeStatus[u] = 'live';
     } catch {
       S.probeStatus[u] = 'err';
     }
+    renderCurrentList();
   }
 
   btn.textContent = '⚡ Probe Live Status';
-  renderSitemapExplorer();
-  toast('Sitemap URLs probed!', 'ok');
+  toast('Probing complete!', 'ok');
+}
+
+async function probeSelectedUrls() {
+  if (!S.selected.size) return;
+  const urls = Array.from(S.selected);
+  toast(`Probing ${urls.length} selected endpoints...`, 'ok');
+  for (const u of urls) {
+    try {
+      await fetch(u, { mode: 'no-cors', signal: AbortSignal.timeout(2000) });
+      S.probeStatus[u] = 'live';
+    } catch {
+      S.probeStatus[u] = 'err';
+    }
+    renderCurrentList();
+  }
+  toast('Selected endpoints probed!', 'ok');
 }
 
 // ── PATRICK STOX STYLE RULE TESTER ──
@@ -933,22 +897,28 @@ function expJSON() {
     robotsTxt: { raw: S.raw },
     rules: S.rules,
     sitemaps: S.sitemaps,
-    extractedSitemapUrls: S.extractedUrls
+    extractedSitemapUrls: S.extractedSitemapUrls
   };
   dl('robotscheck.json', JSON.stringify(d, null, 2), 'application/json');
 }
 
 function expMD() {
   const dis = S.rules.filter(r => r.type === 'dis');
+  const all = S.rules.filter(r => r.type === 'all');
   let md = `# RobotsCheck Recon Report: ${S.base}\n\n*Timestamp: ${new Date().toLocaleString()}*\n\n## Disallowed Endpoints (${dis.length})\n\n`;
   dis.forEach(d => {
     const full = resolveEndpointUrl(S.base, d.path);
     md += `- \`${d.path}\` (Agent: \`${d.agent}\`) → [${full}](${full})\n`;
   });
+  md += `\n## Allowed Endpoints (${all.length})\n\n`;
+  all.forEach(a => {
+    const full = resolveEndpointUrl(S.base, a.path);
+    md += `- \`${a.path}\` (Agent: \`${a.agent}\`) → [${full}](${full})\n`;
+  });
   md += `\n## Sitemaps (${S.sitemaps.length})\n\n`;
   S.sitemaps.forEach(u => md += `- [${u}](${u})\n`);
-  md += `\n## Sitemap Extracted URLs (${S.extractedUrls.length})\n\n`;
-  S.extractedUrls.slice(0, 100).forEach(u => md += `- [${u}](${u})\n`);
+  md += `\n## Sitemap Extracted URLs (${S.extractedSitemapUrls.length})\n\n`;
+  S.extractedSitemapUrls.slice(0, 100).forEach(u => md += `- [${u}](${u})\n`);
   dl('robotscheck.md', md, 'text/markdown');
 }
 
@@ -958,18 +928,19 @@ function expCSV() {
     const full = r.type === 'sitemap' ? r.path : resolveEndpointUrl(S.base, r.path);
     c += `${r.type},"${r.agent}","${r.path}","${full}"\n`;
   });
-  S.extractedUrls.forEach(u => {
+  S.extractedSitemapUrls.forEach(u => {
     c += `sitemap_url,"*",,"${u}"\n`;
   });
   dl('robotscheck.csv', c, 'text/csv');
 }
 
 function expTXT() {
-  const dis = S.rules.filter(r => r.type === 'dis');
   let t = `# RobotsCheck Recon — ${S.base}\n# Disallowed Endpoints:\n`;
-  dis.forEach(d => t += resolveEndpointUrl(S.base, d.path) + '\n');
-  t += `\n# Sitemap URLs (${S.extractedUrls.length}):\n`;
-  S.extractedUrls.forEach(u => t += u + '\n');
+  S.rules.filter(r => r.type === 'dis').forEach(d => t += resolveEndpointUrl(S.base, d.path) + '\n');
+  t += `\n# Allowed Endpoints:\n`;
+  S.rules.filter(r => r.type === 'all').forEach(a => t += resolveEndpointUrl(S.base, a.path) + '\n');
+  t += `\n# Sitemap URLs (${S.extractedSitemapUrls.length}):\n`;
+  S.extractedSitemapUrls.forEach(u => t += u + '\n');
   dl('robotscheck.txt', t, 'text/plain');
 }
 
@@ -1017,12 +988,6 @@ function copyT(t) {
   navigator.clipboard.writeText(t).then(() => toast('Copied URL!', 'ok'));
 }
 
-function copyAllDis() {
-  const dis = S.rules.filter(r => r.type === 'dis');
-  const text = dis.map(d => resolveEndpointUrl(S.base, d.path)).join('\n');
-  navigator.clipboard.writeText(text).then(() => toast(`Copied ${dis.length} URLs!`, 'ok'));
-}
-
 function toast(msg, type = 'ok') {
   const c = document.getElementById('toast');
   const d = document.createElement('div');
@@ -1067,9 +1032,7 @@ function toast(msg, type = 'ok') {
     ctx.clearRect(0, 0, W, H);
     for (let i = 0; i < nodes.length; i++) {
       for (let j = i + 1; j < nodes.length; j++) {
-        const dx = nodes[i].x - nodes[j].x;
-        const dy = nodes[i].y - nodes[j].y;
-        const d = Math.hypot(dx, dy);
+        const dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y, d = Math.hypot(dx, dy);
         if (d < 130) {
           ctx.beginPath();
           ctx.moveTo(nodes[i].x, nodes[i].y);
