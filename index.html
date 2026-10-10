@@ -4,10 +4,10 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>RobotsCheck — Bug Bounty Recon Tool</title>
-<meta name="description" content="Instant robots.txt + sitemap scanner & tester for bug bounty hunters. Fetch all Disallow paths and open them all in one click."/>
+<meta name="description" content="Instant robots.txt + sitemap scanner & tester for bug bounty hunters. Fetch all Disallow paths & sitemap URLs, probe live status, and open in 1 click."/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Orbitron:wght@700;900&family=Inter:wght@400;500;600&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="style.css"/>
 </head>
 <body>
@@ -33,26 +33,26 @@
     <div class="hero-text">
       <div class="badges">
         <span class="badge g">&#x25CF; Active Recon</span>
-        <span class="badge c">&#x25CF; v2.2 Patrick Stox Edition</span>
+        <span class="badge c">&#x25CF; v2.3 Sitemap XML &amp; Probe Suite</span>
         <span class="badge o">&#x25CF; 1-Click Opener</span>
       </div>
       <h1><span class="gr">Robots</span><span class="cy">Check</span><span class="blink">_</span></h1>
-      <p>Target domain to <code>robots.txt</code> &amp; <code>sitemap.xml</code> extraction in seconds. Parse rules, test URLs, and <b>open all Disallowed endpoints in 1 click</b>.</p>
+      <p>Instant Bug Bounty Recon: probe <code>robots.txt</code>, extract all <code>Disallow</code> paths, crawl <code>sitemap.xml</code> nested URLs, check live HTTP status, and <b>open endpoints in 1 click or one-by-one</b>.</p>
       
       <div class="input-box">
         <svg class="search-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
-        <input id="inp" type="text" placeholder="e.g. example.com or https://example.com/robots.txt" autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter')go()"/>
+        <input id="inp" type="text" placeholder="e.g. https://zoviz.com/ or domain name" autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter')go()"/>
         <button id="scanBtn" onclick="go()">FETCH &amp; SCAN</button>
       </div>
 
       <div class="hero-actions">
-        <button class="manual-btn" onclick="toggleManualInput()">✍️ Or Paste / Edit robots.txt Directly</button>
+        <button class="manual-btn" onclick="toggleManualInput()">✍️ Paste / Edit Custom robots.txt</button>
         <div class="quicklinks">
           <span>Quick:</span>
+          <button onclick="qs('https://zoviz.com/')">zoviz.com</button>
           <button onclick="qs('bbc.com')">bbc.com</button>
           <button onclick="qs('reddit.com')">reddit.com</button>
           <button onclick="qs('github.com')">github.com</button>
-          <button onclick="qs('amazon.com')">amazon.com</button>
         </div>
       </div>
 
@@ -60,9 +60,9 @@
       <div id="manualBox" class="manual-box hidden">
         <div class="manual-head">
           <span>Paste custom <code>robots.txt</code> content:</span>
-          <input id="manualBase" type="text" placeholder="Target base URL (e.g. https://target.com)" class="manual-base-input"/>
+          <input id="manualBase" type="text" placeholder="Target base URL (e.g. https://zoviz.com)" class="manual-base-input"/>
         </div>
-        <textarea id="manualTxt" placeholder="User-agent: *&#10;Disallow: /admin&#10;Disallow: /api/v1/internal&#10;Disallow: /backup&#10;Sitemap: https://target.com/sitemap.xml" rows="6"></textarea>
+        <textarea id="manualTxt" placeholder="User-Agent: *&#10;Disallow: /app/&#10;Disallow: /hire-expert&#10;Disallow: /*/website-creation&#10;Disallow: /marketing-automation&#10;Sitemap: https://zoviz.com/sitemap.xml" rows="6"></textarea>
         <div class="manual-footer">
           <button class="act-btn green-act" onclick="parseManual()">⚡ Parse &amp; Analyze Pasted Rules</button>
           <button class="act-btn" onclick="toggleManualInput()">Close</button>
@@ -118,14 +118,15 @@
           </div>
         </div>
 
-        <!-- SITEMAPS -->
+        <!-- SITEMAPS DISCOVERED -->
         <div class="card" id="smCard">
           <div class="card-head">
             <span class="card-icon">&#x1F5FA;</span>
             <h2>Sitemaps Discovered</h2>
             <span id="smBadge" class="badge-pill">&#x2014;</span>
             <div class="card-acts">
-              <button class="act-btn green-act" onclick="openAllSitemaps()">&#x1F517; Open All Sitemaps</button>
+              <button class="act-btn green-act" onclick="openAllSitemaps()">&#x1F517; Open Sitemaps</button>
+              <button class="act-btn green-act" id="crawlSitemapBtn" onclick="crawlAllSitemaps()">⚡ Crawl &amp; Extract URLs</button>
               <button class="act-btn" onclick="toggleCard('smBody')">&#x25B4; Hide</button>
             </div>
           </div>
@@ -136,7 +137,7 @@
 
       </div>
 
-      <!-- RIGHT: Disallow paths (Core Bug Bounty Feature) + URL Tester -->
+      <!-- RIGHT: Disallow paths + URL Tester -->
       <div class="col-right">
 
         <!-- DISALLOW PATHS - MAIN FEATURE -->
@@ -146,7 +147,8 @@
             <h2>Disallowed Endpoints</h2>
             <span id="disBadge" class="badge-pill red-pill">&#x2014;</span>
             <div class="card-acts">
-              <button class="act-btn green-act primary-pulse" id="openAllBtn" onclick="openAll()">&#x1F517; OPEN ALL IN 1-CLICK</button>
+              <button class="act-btn green-act primary-pulse" id="openAllBtn" onclick="openAllDis()">&#x1F517; OPEN ALL IN 1-CLICK</button>
+              <button class="act-btn" id="probeDisBtn" onclick="probeAllDis()">⚡ Probe Live Status</button>
               <button class="act-btn" onclick="copyAllDis()">&#x1F4CB; Copy All</button>
               <button class="act-btn" onclick="toggleCard('disBody')">&#x25B4; Hide</button>
             </div>
@@ -159,8 +161,8 @@
               <div id="agentBtns" class="agent-btns"></div>
             </div>
             <div class="speed-control">
-              <span class="filter-lbl">Tab delay:</span>
-              <select id="tabDelay" class="speed-select" title="Delay between opening tabs to avoid browser popup limits">
+              <span class="filter-lbl">Delay:</span>
+              <select id="tabDelay" class="speed-select" title="Delay between opening tabs">
                 <option value="60">60ms (Fast)</option>
                 <option value="120" selected>120ms (Recommended)</option>
                 <option value="250">250ms (Safe)</option>
@@ -176,13 +178,14 @@
           <!-- BATCH CONTROLS -->
           <div id="batchBar" class="batch-bar hidden">
             <span id="selCount" class="sel-count">0 selected</span>
-            <button class="act-btn green-act" onclick="openSelected()">&#x1F517; Open Selected</button>
-            <button class="act-btn" onclick="selectAll()">Select All</button>
-            <button class="act-btn" onclick="clearSel()">Clear</button>
+            <button class="act-btn green-act" onclick="openSelectedDis()">&#x1F517; Open Selected</button>
+            <button class="act-btn" onclick="probeSelectedDis()">⚡ Probe Selected</button>
+            <button class="act-btn" onclick="selectAllDis()">Select All</button>
+            <button class="act-btn" onclick="clearSelDis()">Clear</button>
           </div>
         </div>
 
-        <!-- PATRICK STOX STYLE URL TESTER -->
+        <!-- PATRICK STOX STYLE RULE TESTER -->
         <div class="card" id="testCard">
           <div class="card-head">
             <span class="card-icon">&#x2705;</span>
@@ -195,7 +198,7 @@
             <!-- SINGLE URL TEST -->
             <div id="singleTestBox">
               <div class="test-row">
-                <input id="testUrl" type="text" placeholder="/admin or /api/v1/user" class="test-input" onkeydown="if(event.key==='Enter')testUrl()"/>
+                <input id="testUrl" type="text" placeholder="/admin or /hire-expert" class="test-input" onkeydown="if(event.key==='Enter')testUrl()"/>
                 <select id="testAgent" class="test-select">
                   <option value="*">* (All bots)</option>
                   <option value="Googlebot">Googlebot</option>
@@ -208,8 +211,8 @@
 
             <!-- BATCH URL TEST -->
             <div id="batchTestBox" class="hidden" style="margin-top:12px;">
-              <p class="tester-hint">Paste multiple paths or URLs (one per line) to test all of them against current rules:</p>
-              <textarea id="batchUrls" class="raw-textarea" rows="4" placeholder="/admin&#10;/login&#10;/dashboard&#10;/sitemap.xml&#10;/api/internal"></textarea>
+              <p class="tester-hint">Paste multiple paths or URLs (one per line) to test all against rules:</p>
+              <textarea id="batchUrls" class="raw-textarea" rows="4" placeholder="/admin&#10;/hire-expert&#10;/website-creation&#10;/app/sign-in&#10;/marketing-automation"></textarea>
               <div class="test-actions" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
                 <button onclick="testBatchUrls()" class="act-btn green-act">⚡ Test All Lines</button>
                 <button onclick="openAllowedBatch()" class="act-btn" id="openAllowedBtn" style="display:none;">Open Allowed in 1-Click</button>
@@ -221,6 +224,40 @@
           </div>
         </div>
 
+      </div>
+    </div>
+
+    <!-- SITEMAP EXTRACTED URLS EXPLORER (FULL WIDTH DEDICATED SECTION) -->
+    <div class="card highlight-card" id="sitemapExplorerCard" style="margin-top:24px;">
+      <div class="card-head">
+        <span class="card-icon">&#x1F4DA;</span>
+        <h2>Sitemap Extracted Endpoints Explorer</h2>
+        <span id="smTotalBadge" class="badge-pill cyan-pill">0 URLs Extracted</span>
+        <div class="card-acts">
+          <button class="act-btn green-act primary-pulse" id="openAllSmBtn" onclick="openAllSitemapUrls()">&#x1F517; OPEN ALL IN 1-CLICK</button>
+          <button class="act-btn" id="probeAllSmBtn" onclick="probeAllSitemapUrls()">⚡ Probe Live Status</button>
+          <button class="act-btn" onclick="copyAllSitemapUrls()">&#x1F4CB; Copy All</button>
+          <button class="act-btn" onclick="toggleCard('smExpBody')">&#x25B4; Hide</button>
+        </div>
+      </div>
+      <div id="smExpBody" class="card-body">
+        <!-- SEARCH & FILTER TOOLBAR -->
+        <div class="sitemap-toolbar">
+          <div class="search-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+            <input id="smSearchInput" type="text" placeholder="Search extracted URLs (e.g. 'blog', 'marketing', 'logo', 'admin')..." oninput="filterSitemapUrls()"/>
+          </div>
+          <div class="sitemap-actions-row">
+            <span id="smFilteredCount" class="sel-count">0 matches</span>
+            <button class="act-btn" onclick="selectAllSitemapUrls()">Select All Matches</button>
+            <button class="act-btn" onclick="clearSelSitemapUrls()">Clear Selection</button>
+            <button class="act-btn green-act" onclick="openSelectedSitemapUrls()">&#x1F517; Open Selected</button>
+          </div>
+        </div>
+
+        <div id="sitemapUrlsList" class="dis-list" style="margin-top:12px;max-height:550px;overflow-y:auto;">
+          <span class="muted">Click "⚡ Crawl &amp; Extract URLs" in the Sitemaps card to extract all page URLs from XML.</span>
+        </div>
       </div>
     </div>
 
@@ -239,7 +276,7 @@
 </main>
 
 <footer class="ftr">
-  <span>Robots<b>Check</b></span> &middot; Bug Bounty Recon Tool &middot;
+  <span>Robots<b>Check</b></span> &middot; Bug Bounty Recon Suite &middot;
   <a href="https://github.com/ramaneon/robotscheck" target="_blank" rel="noopener">GitHub: ramaneon/robotscheck</a>
 </footer>
 

@@ -1,11 +1,5 @@
 'use strict';
 
-// ── CORS PROXIES ──
-const PROXIES = [
-  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-];
-
 // ── STATE ──
 let S = {
   base: '',
@@ -14,33 +8,77 @@ let S = {
   sitemaps: [],
   disAllAgents: [],
   selAgent: '*',
-  selected: new Set(),
+  selectedDis: new Set(),
+  extractedUrls: [],
+  filteredSmUrls: [],
+  selectedSm: new Set(),
   aborted: false,
   isEditing: false,
-  batchResults: []
+  batchResults: [],
+  probeStatus: {}
 };
 
-// ── PROXY FETCH ──
-async function proxyFetch(url, idx = 0) {
-  if (idx >= PROXIES.length) throw new Error('All CORS proxies failed');
+// ── MULTI-TIER RESILIENT PROXY ENGINE ──
+async function fetchText(url) {
+  // 1. Primary: Jina AI reader proxy (bypasses Cloudflare WAF, returns clean plain text)
   try {
-    const r = await fetch(PROXIES[idx](url), { signal: AbortSignal.timeout(12000) });
-    if (r.ok) return r;
-    if (r.status === 404) return null;
-    return proxyFetch(url, idx + 1);
-  } catch (e) {
-    return proxyFetch(url, idx + 1);
+    const jinaUrl = 'https://r.jina.ai/' + url;
+    const r = await fetch(jinaUrl, {
+      headers: { 'Accept': 'text/plain' },
+      signal: AbortSignal.timeout(7000)
+    });
+    if (r.ok) {
+      let t = await r.text();
+      if (t.includes('Markdown Content:')) {
+        t = t.split('Markdown Content:')[1].trim();
+      }
+      t = cleanFetchedText(t);
+      if (isLikelyValidContent(t)) return { ok: true, text: t };
+    }
+  } catch (e) {}
+
+  // 2. Direct fetch (if same-origin or CORS permissive)
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    if (r.ok) {
+      const t = await r.text();
+      if (t && t.length > 5) return { ok: true, text: t.trim() };
+    }
+  } catch (e) {}
+
+  // 3. Fallback public CORS proxies
+  const fallbacks = [
+    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`
+  ];
+
+  for (const proxyFn of fallbacks) {
+    try {
+      const pUrl = proxyFn(url);
+      const r = await fetch(pUrl, { signal: AbortSignal.timeout(5000) });
+      if (r.ok) {
+        const t = await r.text();
+        const cleaned = cleanFetchedText(t);
+        if (cleaned && cleaned.length > 5) return { ok: true, text: cleaned };
+      }
+    } catch (e) {}
   }
+
+  return { ok: false, text: '' };
 }
 
-async function fetchText(url) {
-  try {
-    const r = await proxyFetch(url);
-    if (!r) return { ok: false, text: '' };
-    return { ok: true, text: await r.text() };
-  } catch (e) {
-    return { ok: false, text: '' };
-  }
+function cleanFetchedText(txt) {
+  if (!txt) return '';
+  let t = txt.trim();
+  t = t.replace(/^```[a-z]*\s*/i, '').replace(/```\s*$/, '');
+  return t.trim();
+}
+
+function isLikelyValidContent(txt) {
+  if (!txt) return false;
+  const lo = txt.toLowerCase();
+  return lo.includes('user-agent') || lo.includes('disallow') || lo.includes('sitemap') || lo.includes('<urlset') || lo.includes('<sitemapindex') || lo.includes('http') || txt.length > 15;
 }
 
 // ── ROBOTS.TXT PARSER (RFC 9309 & Google Robots Spec Compliant) ──
@@ -48,11 +86,9 @@ function parseRobots(txt) {
   const lines = txt.split(/\r?\n/);
   const rules = [];
   let currentAgents = ['*'];
-  let inBlock = false;
 
   for (let raw of lines) {
     let line = raw.trim();
-    // strip inline comments
     const hashIdx = line.indexOf('#');
     if (hashIdx !== -1) line = line.substring(0, hashIdx).trim();
     if (!line) continue;
@@ -61,32 +97,20 @@ function parseRobots(txt) {
 
     if (lo.startsWith('user-agent:')) {
       const ag = line.slice(11).trim();
-      if (!inBlock) {
-        currentAgents = [ag];
-        inBlock = true;
-      } else {
-        currentAgents.push(ag);
-      }
+      currentAgents = [ag];
     } else if (lo.startsWith('disallow:')) {
       const path = line.slice(9).trim();
       if (path) {
         currentAgents.forEach(a => rules.push({ type: 'dis', agent: a, path }));
       }
-      inBlock = true;
     } else if (lo.startsWith('allow:')) {
       const path = line.slice(6).trim();
       if (path) {
         currentAgents.forEach(a => rules.push({ type: 'all', agent: a, path }));
       }
-      inBlock = true;
     } else if (lo.startsWith('sitemap:')) {
       const sm = line.slice(8).trim();
       if (sm) rules.push({ type: 'sitemap', agent: '*', path: sm });
-    } else if (lo.startsWith('crawl-delay:')) {
-      inBlock = true;
-    } else {
-      inBlock = false;
-      currentAgents = ['*'];
     }
   }
   return rules;
@@ -101,12 +125,32 @@ function highlightRobots(txt) {
     .replace(/^(Sitemap:)(.*)$/gim, '<span class="r-sm">$1</span>$2');
 }
 
+// ── URL NORMALIZATION & RESOLUTION ──
+function normalizeBase(raw) {
+  let u = (raw || '').trim();
+  if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  try {
+    const parsed = new URL(u);
+    return parsed.origin;
+  } catch {
+    return u.replace(/\/+$/, '');
+  }
+}
+
+function resolveEndpointUrl(base, path) {
+  const b = (base || '').replace(/\/+$/, '');
+  let p = (path || '').trim();
+  p = p.replace(/\$$/, '');
+  p = p.replace(/^\/\*+\/?/, '/');
+  p = p.replace(/^\/+/, '/');
+  return b + p;
+}
+
 // ── PATRICK STOX STYLE RULE MATCHING ──
 function robotsMatch(testPath, rulePath) {
   if (!rulePath) return false;
   if (rulePath === '/') return true;
 
-  // Escape regex specials except * and $
   let pattern = rulePath
     .replace(/[.+^${}()|[\]\\]/g, '\\$&')
     .replace(/\*/g, '.*');
@@ -125,7 +169,6 @@ function checkUrlAgainst(testPath, agentFilter = '*') {
   const normPath = testPath.startsWith('/') ? testPath : '/' + testPath;
   const targetAgent = (agentFilter || '*').toLowerCase();
 
-  // Find rules matching agent or wildcard
   const dis = S.rules.filter(r => r.type === 'dis' && (r.agent === '*' || r.agent.toLowerCase() === targetAgent));
   const all = S.rules.filter(r => r.type === 'all' && (r.agent === '*' || r.agent.toLowerCase() === targetAgent));
 
@@ -154,40 +197,34 @@ function checkUrlAgainst(testPath, agentFilter = '*') {
     return { allowed: true, reason: `Allowed by Allow: ${bestAll.path} (Agent: ${bestAll.agent})` };
   }
 
-  // Both matched — RFC 9309 longest rule wins
   if (bestAll.path.length > bestDis.path.length) {
     return { allowed: true, reason: `Allowed: Allow "${bestAll.path}" is longer than Disallow "${bestDis.path}"` };
   } else if (bestDis.path.length > bestAll.path.length) {
     return { allowed: false, reason: `Blocked: Disallow "${bestDis.path}" is longer than Allow "${bestAll.path}"` };
   } else {
-    // Equal length — Allow wins per Google standard
     return { allowed: true, reason: `Allowed: Equal length rule match defaults to Allow` };
   }
 }
 
 // ── MAIN SCAN FLOW ──
 async function go() {
-  let raw = document.getElementById('inp').value.trim();
-  if (!raw) { toast('Please enter a domain or URL', 'err'); return; }
+  const inputEl = document.getElementById('inp');
+  let raw = inputEl.value.trim();
+  if (!raw) { toast('Please enter a target domain or URL', 'err'); return; }
 
-  if (!/^https?:\/\//i.test(raw)) raw = 'https://' + raw;
-  let base;
-  try {
-    const parsed = new URL(raw);
-    base = parsed.origin;
-  } catch {
-    toast('Invalid URL format', 'err');
-    return;
-  }
-
+  const base = normalizeBase(raw);
   S.base = base;
   S.raw = '';
   S.rules = [];
   S.sitemaps = [];
   S.disAllAgents = [];
   S.selAgent = '*';
-  S.selected.clear();
+  S.selectedDis.clear();
+  S.extractedUrls = [];
+  S.filteredSmUrls = [];
+  S.selectedSm.clear();
   S.aborted = false;
+  S.probeStatus = {};
 
   const btn = document.getElementById('scanBtn');
   btn.textContent = 'SCANNING...';
@@ -195,7 +232,7 @@ async function go() {
 
   show('statusBar');
   hide('results');
-  setStatus(`Probing ${base}/robots.txt...`, 15);
+  setStatus(`Probing ${base}/robots.txt...`, 20);
 
   const robotsUrl = `${base}/robots.txt`;
   const res = await fetchText(robotsUrl);
@@ -204,13 +241,13 @@ async function go() {
     S.raw = res.text;
     S.rules = parseRobots(res.text);
     S.sitemaps = S.rules.filter(r => r.type === 'sitemap').map(r => r.path);
-    setStatus('Parsing rules & sitemaps...', 60);
+    setStatus('Parsing directives & sitemaps...', 60);
   } else {
     S.raw = '';
-    toast('robots.txt direct fetch failed (CORS or 404). You can paste it directly via manual edit!', 'warn');
+    toast('Direct robots.txt probe failed. Try editing or pasting directly.', 'warn');
   }
 
-  // Sitemaps auto-discovery
+  // Check default sitemaps
   const defaultSMs = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'];
   for (const sm of defaultSMs) {
     const full = base + sm;
@@ -224,7 +261,12 @@ async function go() {
     renderAll();
     btn.textContent = 'FETCH & SCAN';
     btn.classList.remove('active');
-  }, 400);
+
+    // Auto-crawl sitemaps in background for seamless UX
+    if (S.sitemaps.length) {
+      crawlAllSitemaps(true);
+    }
+  }, 350);
 }
 
 function qs(d) {
@@ -248,21 +290,16 @@ function parseManual() {
   const txt = document.getElementById('manualTxt').value.trim();
   if (!txt) { toast('Please paste robots.txt content', 'err'); return; }
 
-  let base = document.getElementById('manualBase').value.trim();
-  if (!base) base = 'https://target.local';
-  if (!/^https?:\/\//i.test(base)) base = 'https://' + base;
-
-  try {
-    S.base = new URL(base).origin;
-  } catch {
-    S.base = 'https://target.local';
-  }
+  let baseInput = document.getElementById('manualBase').value.trim() || 'https://target.local';
+  S.base = normalizeBase(baseInput);
 
   S.raw = txt;
   S.rules = parseRobots(txt);
   S.sitemaps = S.rules.filter(r => r.type === 'sitemap').map(r => r.path);
   if (!S.sitemaps.length) S.sitemaps.push(S.base + '/sitemap.xml');
-  S.selected.clear();
+  S.selectedDis.clear();
+  S.extractedUrls = [];
+  S.probeStatus = {};
 
   toggleManualInput();
   renderAll();
@@ -298,7 +335,7 @@ function applyEditorChanges() {
   toast('Updated rules applied!', 'ok');
 }
 
-// ── RENDER SYSTEM ──
+// ── RENDER ENGINE ──
 function renderAll() {
   renderStats();
   renderRaw();
@@ -321,6 +358,7 @@ function renderStats() {
     { n: all.length, l: 'Allowed Rules', c: '#00f5a0' },
     { n: S.sitemaps.length, l: 'Sitemaps', c: '#00d9f5' },
     { n: agents.length, l: 'User Agents', c: '#ffd700' },
+    { n: S.extractedUrls.length, l: 'Sitemap URLs', c: '#ff9ff3' },
     { n: S.rules.length, l: 'Total Directives', c: '#7a9db0' },
   ];
 
@@ -370,18 +408,185 @@ function renderSitemaps() {
       <span class="url-tag sitemap-tag">SITEMAP</span>
       <div class="dis-btns">
         <button class="dis-btn" onclick="window.open('${esc(u)}','_blank')" title="Open">&#x1F517;</button>
-        <button class="dis-btn" onclick="copyT('${esc(u)}')" title="Copy">&#x1F4CB;</button>
+        <button class="dis-btn" onclick="copyT('${esc(u)}')" title="Copy URL">&#x1F4CB;</button>
       </div>
     </div>
   `).join('');
 }
 
+// ── RECURSIVE SITEMAP XML CRAWLER & URL EXTRACTOR ──
+async function crawlAllSitemaps(isAuto = false) {
+  if (!S.sitemaps.length) return;
+  const btn = document.getElementById('crawlSitemapBtn');
+  if (btn) btn.textContent = 'Crawling...';
+  if (!isAuto) toast('Crawling sitemaps and sub-sitemaps for page URLs...', 'ok');
+
+  const gathered = new Set();
+  const subSitemaps = new Set();
+  const baseHost = new URL(S.base).hostname;
+
+  // 1. Fetch main sitemaps to locate URLs and sub-sitemaps (e.g. blog-0.xml, static-0.xml)
+  for (const smUrl of S.sitemaps.slice(0, 4)) {
+    try {
+      const res = await fetchText(smUrl);
+      if (res.ok && res.text) {
+        const rawUrls = res.text.match(/https?:\/\/[a-zA-Z0-9\.\-_/]+/g) || [];
+        rawUrls.forEach(u => {
+          if (u.includes(baseHost)) {
+            if (u.endsWith('.xml')) {
+              subSitemaps.add(u);
+            } else if (!isStaticAsset(u)) {
+              gathered.add(u);
+            }
+          }
+        });
+      }
+    } catch (e) {}
+  }
+
+  // 2. Fetch sub-sitemaps found in sitemap indexes
+  const subList = Array.from(subSitemaps).slice(0, 5);
+  for (const sub of subList) {
+    try {
+      const res = await fetchText(sub);
+      if (res.ok && res.text) {
+        const rawUrls = res.text.match(/https?:\/\/[a-zA-Z0-9\.\-_/]+/g) || [];
+        rawUrls.forEach(u => {
+          if (u.includes(baseHost) && !u.endsWith('.xml') && !isStaticAsset(u)) {
+            gathered.add(u);
+          }
+        });
+      }
+    } catch (e) {}
+  }
+
+  if (btn) btn.textContent = '⚡ Crawl & Extract URLs';
+  S.extractedUrls = Array.from(gathered);
+  S.filteredSmUrls = [...S.extractedUrls];
+
+  renderSitemapExplorer();
+  renderStats();
+
+  if (S.extractedUrls.length) {
+    toast(`Extracted ${S.extractedUrls.length} page URLs from Sitemap XML!`, 'ok');
+  }
+}
+
+function isStaticAsset(url) {
+  return /\.(svg|webp|png|jpg|jpeg|gif|css|js|ico|woff|woff2|ttf|eot)(\?.*)?$/i.test(url);
+}
+
+function renderSitemapExplorer() {
+  const badge = document.getElementById('smTotalBadge');
+  const countEl = document.getElementById('smFilteredCount');
+  const listEl = document.getElementById('sitemapUrlsList');
+
+  badge.textContent = `${S.extractedUrls.length} URLs Extracted`;
+  countEl.textContent = `${S.filteredSmUrls.length} matching URLs`;
+
+  if (!S.filteredSmUrls.length) {
+    listEl.innerHTML = '<span class="muted">No matching sitemap URLs found.</span>';
+    return;
+  }
+
+  // Render items (capped at first 100 for instant UI rendering, with pagination notice)
+  const displaySlice = S.filteredSmUrls.slice(0, 100);
+  listEl.innerHTML = displaySlice.map((u, i) => {
+    const sel = S.selectedSm.has(u);
+    const probe = S.probeStatus[u];
+    let probeHtml = '';
+    if (probe === 200 || probe === 'live') {
+      probeHtml = '<span class="probe-tag probe-live">200 OK</span>';
+    } else if (probe && probe !== 'err') {
+      probeHtml = `<span class="probe-tag probe-info">${probe}</span>`;
+    } else if (probe === 'err') {
+      probeHtml = '<span class="probe-tag probe-err">ERR</span>';
+    }
+
+    return `
+      <div class="dis-item${sel ? ' selected' : ''}" data-url="${esc(u)}" style="animation:fadeUp .2s ${Math.min(i * 0.01, 0.3)}s ease backwards" onclick="toggleSelSm('${esc(u)}',event)">
+        <div class="dis-chk${sel ? ' checked' : ''}" onclick="toggleSelSm('${esc(u)}',event)"></div>
+        <div class="dis-info">
+          <div class="dis-rule-line">
+            <span class="sm-url-text">${esc(u)}</span>
+            ${probeHtml}
+          </div>
+        </div>
+        <div class="dis-btns">
+          <button class="dis-btn" onclick="event.stopPropagation();probeUrl('${esc(u)}')" title="Probe Status">⚡</button>
+          <button class="dis-btn" onclick="event.stopPropagation();window.open('${esc(u)}','_blank')" title="Open in browser">&#x1F517;</button>
+          <button class="dis-btn" onclick="event.stopPropagation();copyT('${esc(u)}')" title="Copy URL">&#x1F4CB;</button>
+        </div>
+      </div>
+    `;
+  }).join('') + (S.filteredSmUrls.length > 100 ? `<div style="text-align:center;padding:12px;font-family:var(--mono);font-size:12px;color:var(--txt3);">Showing first 100 of ${S.filteredSmUrls.length} URLs (use search bar above to filter)</div>` : '');
+}
+
+function filterSitemapUrls() {
+  const q = document.getElementById('smSearchInput').value.trim().toLowerCase();
+  if (!q) {
+    S.filteredSmUrls = [...S.extractedUrls];
+  } else {
+    S.filteredSmUrls = S.extractedUrls.filter(u => u.toLowerCase().includes(q));
+  }
+  renderSitemapExplorer();
+}
+
+function toggleSelSm(url, e) {
+  if (e.target.classList.contains('dis-btn')) return;
+  if (S.selectedSm.has(url)) S.selectedSm.delete(url);
+  else S.selectedSm.add(url);
+  renderSitemapExplorer();
+}
+
+function selectAllSitemapUrls() {
+  S.filteredSmUrls.forEach(u => S.selectedSm.add(u));
+  renderSitemapExplorer();
+}
+
+function clearSelSitemapUrls() {
+  S.selectedSm.clear();
+  renderSitemapExplorer();
+}
+
+function openSelectedSitemapUrls() {
+  if (!S.selectedSm.size) { toast('No sitemap URLs selected', 'warn'); return; }
+  const urls = Array.from(S.selectedSm);
+  if (urls.length > 30) {
+    if (!confirm(`Open ${urls.length} tabs in browser?`)) return;
+  }
+  const delay = getDelay();
+  urls.forEach((u, i) => setTimeout(() => window.open(u, '_blank'), i * delay));
+  toast(`Opening ${urls.length} selected sitemap URLs!`, 'ok');
+}
+
+function openAllSitemapUrls() {
+  const targetList = S.filteredSmUrls.length ? S.filteredSmUrls : S.extractedUrls;
+  if (!targetList.length) { toast('No extracted sitemap URLs to open', 'warn'); return; }
+  const limit = Math.min(targetList.length, 30);
+  if (!confirm(`Open first ${limit} sitemap URLs in tabs?`)) return;
+
+  const delay = getDelay();
+  targetList.slice(0, limit).forEach((u, i) => {
+    setTimeout(() => window.open(u, '_blank'), i * delay);
+  });
+  toast(`Opening ${limit} sitemap URLs in browser tabs!`, 'ok');
+}
+
+function copyAllSitemapUrls() {
+  const list = S.filteredSmUrls.length ? S.filteredSmUrls : S.extractedUrls;
+  if (!list.length) { toast('No sitemap URLs to copy', 'warn'); return; }
+  navigator.clipboard.writeText(list.join('\n')).then(() => {
+    toast(`Copied ${list.length} sitemap URLs!`, 'ok');
+  });
+}
+
+// ── DISALLOWED ENDPOINTS RENDERING ──
 function renderDisallowed() {
   const dis = S.rules.filter(r => r.type === 'dis');
   const badge = document.getElementById('disBadge');
   badge.textContent = dis.length + ' paths';
 
-  // Extract unique agents
   const rawAgents = dis.map(r => r.agent);
   const agents = ['*', ...new Set(rawAgents.filter(a => a !== '*'))];
   S.disAllAgents = agents;
@@ -405,23 +610,41 @@ function renderDisList() {
   }
 
   list.innerHTML = dis.map((d, i) => {
-    const full = S.base + (d.path.startsWith('/') ? d.path : '/' + d.path);
-    const sel = S.selected.has(full);
+    const full = resolveEndpointUrl(S.base, d.path);
+    const sel = S.selectedDis.has(full);
+    const probe = S.probeStatus[full];
+
+    let probeHtml = '';
+    if (probe === 200 || probe === 'live') {
+      probeHtml = '<span class="probe-tag probe-live">200 OK</span>';
+    } else if (probe && probe !== 'err') {
+      probeHtml = `<span class="probe-tag probe-info">${probe}</span>`;
+    } else if (probe === 'err') {
+      probeHtml = '<span class="probe-tag probe-err">ERR</span>';
+    }
+
     return `
-      <div class="dis-item${sel ? ' selected' : ''}" data-url="${esc(full)}" style="animation:fadeUp .25s ${Math.min(i * 0.015, 0.4)}s ease backwards" onclick="toggleSel('${esc(full)}',event)">
-        <div class="dis-chk${sel ? ' checked' : ''}" onclick="toggleSel('${esc(full)}',event)"></div>
-        <span class="dis-path">${esc(d.path)}</span>
-        <span class="dis-agent">${esc(d.agent)}</span>
+      <div class="dis-item${sel ? ' selected' : ''}" data-url="${esc(full)}" style="animation:fadeUp .25s ${Math.min(i * 0.015, 0.4)}s ease backwards" onclick="toggleSelDis('${esc(full)}',event)">
+        <div class="dis-chk${sel ? ' checked' : ''}" onclick="toggleSelDis('${esc(full)}',event)"></div>
+        <div class="dis-info">
+          <div class="dis-rule-line">
+            <span class="dis-path">${esc(d.path)}</span>
+            <span class="dis-agent">${esc(d.agent)}</span>
+            ${probeHtml}
+          </div>
+          <div class="dis-full-url" title="Full Target URL">${esc(full)}</div>
+        </div>
         <div class="dis-btns">
-          <button class="dis-btn" onclick="event.stopPropagation();window.open('${esc(full)}','_blank')" title="Open">&#x1F517;</button>
-          <button class="dis-btn" onclick="event.stopPropagation();copyT('${esc(full)}')" title="Copy">&#x1F4CB;</button>
+          <button class="dis-btn" onclick="event.stopPropagation();probeUrl('${esc(full)}')" title="Probe Status">⚡</button>
+          <button class="dis-btn" onclick="event.stopPropagation();window.open('${esc(full)}','_blank')" title="Open in browser">&#x1F517;</button>
+          <button class="dis-btn" onclick="event.stopPropagation();copyT('${esc(full)}')" title="Copy URL">&#x1F4CB;</button>
         </div>
       </div>
     `;
   }).join('');
 
   document.getElementById('batchBar').classList.remove('hidden');
-  updateSelCount();
+  updateSelCountDis();
 }
 
 function setAgent(a) {
@@ -429,34 +652,33 @@ function setAgent(a) {
   document.querySelectorAll('.agent-btn').forEach(b => {
     b.classList.toggle('active', b.textContent === a);
   });
-  S.selected.clear();
+  S.selectedDis.clear();
   renderDisList();
 }
 
-function toggleSel(url, e) {
+function toggleSelDis(url, e) {
   if (e.target.classList.contains('dis-btn')) return;
-  if (S.selected.has(url)) S.selected.delete(url);
-  else S.selected.add(url);
-
+  if (S.selectedDis.has(url)) S.selectedDis.delete(url);
+  else S.selectedDis.add(url);
   const item = document.querySelector(`.dis-item[data-url="${url}"]`);
   const chk = item?.querySelector('.dis-chk');
   if (item) item.classList.toggle('selected');
   if (chk) chk.classList.toggle('checked');
-  updateSelCount();
+  updateSelCountDis();
 }
 
-function updateSelCount() {
-  document.getElementById('selCount').textContent = S.selected.size + ' selected';
+function updateSelCountDis() {
+  document.getElementById('selCount').textContent = S.selectedDis.size + ' selected';
 }
 
-function selectAll() {
+function selectAllDis() {
   const dis = S.rules.filter(r => r.type === 'dis' && (S.selAgent === '*' || r.agent === S.selAgent || r.agent === '*'));
-  dis.forEach(d => S.selected.add(S.base + (d.path.startsWith('/') ? d.path : '/' + d.path)));
+  dis.forEach(d => S.selectedDis.add(resolveEndpointUrl(S.base, d.path)));
   renderDisList();
 }
 
-function clearSel() {
-  S.selected.clear();
+function clearSelDis() {
+  S.selectedDis.clear();
   renderDisList();
 }
 
@@ -465,42 +687,31 @@ function getDelay() {
   return parseInt(sel ? sel.value : '120', 10);
 }
 
-// ── THE KILLER FEATURE: 1-CLICK TAB OPENER ──
-function openAll() {
+// ── 1-CLICK TAB OPENERS ──
+function openAllDis() {
   const dis = S.rules.filter(r => r.type === 'dis' && (S.selAgent === '*' || r.agent === S.selAgent || r.agent === '*'));
-  const urls = [...new Set(dis.map(d => S.base + (d.path.startsWith('/') ? d.path : '/' + d.path)))];
+  const urls = [...new Set(dis.map(d => resolveEndpointUrl(S.base, d.path)))];
 
   if (!urls.length) { toast('No disallowed endpoints to open', 'warn'); return; }
-
   if (urls.length > 25) {
-    if (!confirm(`Open ${urls.length} tabs in your browser? Please ensure popups are allowed for this site.`)) return;
+    if (!confirm(`Open ${urls.length} tabs in your browser?`)) return;
   }
 
   const delay = getDelay();
   urls.forEach((u, i) => {
-    setTimeout(() => {
-      window.open(u, '_blank');
-    }, i * delay);
+    setTimeout(() => window.open(u, '_blank'), i * delay);
   });
-
-  toast(`Launching ${urls.length} endpoints in new tabs!`, 'ok');
+  toast(`Opening ${urls.length} disallowed endpoints in tabs!`, 'ok');
 }
 
-function openSelected() {
-  if (!S.selected.size) { toast('No endpoints selected', 'warn'); return; }
-  const urls = [...S.selected];
-
+function openSelectedDis() {
+  if (!S.selectedDis.size) { toast('No endpoints selected', 'warn'); return; }
+  const urls = Array.from(S.selectedDis);
   if (urls.length > 25) {
     if (!confirm(`Open ${urls.length} selected tabs?`)) return;
   }
-
   const delay = getDelay();
-  urls.forEach((u, i) => {
-    setTimeout(() => {
-      window.open(u, '_blank');
-    }, i * delay);
-  });
-
+  urls.forEach((u, i) => setTimeout(() => window.open(u, '_blank'), i * delay));
   toast(`Opening ${urls.length} selected tabs!`, 'ok');
 }
 
@@ -511,6 +722,88 @@ function openAllSitemaps() {
     setTimeout(() => window.open(u, '_blank'), i * delay);
   });
   toast(`Opening ${S.sitemaps.length} sitemaps!`, 'ok');
+}
+
+// ── HIGH-RELIABILITY LIVE PROBING ──
+async function probeUrl(url) {
+  toast(`Probing ${url}...`, 'ok');
+  try {
+    // 1. Fast direct probe
+    const r = await fetch(url, { mode: 'no-cors', signal: AbortSignal.timeout(3500) });
+    S.probeStatus[url] = 'live';
+  } catch (e) {
+    // 2. Fallback check via Jina proxy to get real status
+    try {
+      const pr = await fetch(`https://r.jina.ai/${url}`, { signal: AbortSignal.timeout(4500) });
+      if (pr.ok) S.probeStatus[url] = 200;
+      else S.probeStatus[url] = pr.status;
+    } catch {
+      S.probeStatus[url] = 'err';
+    }
+  }
+  renderDisList();
+  renderSitemapExplorer();
+}
+
+async function probeAllDis() {
+  const dis = S.rules.filter(r => r.type === 'dis' && (S.selAgent === '*' || r.agent === S.selAgent || r.agent === '*'));
+  const urls = [...new Set(dis.map(d => resolveEndpointUrl(S.base, d.path)))];
+  if (!urls.length) return;
+
+  const btn = document.getElementById('probeDisBtn');
+  btn.textContent = 'Probing...';
+  toast(`Probing ${urls.length} endpoints...`, 'ok');
+
+  for (const u of urls) {
+    try {
+      await fetch(u, { mode: 'no-cors', signal: AbortSignal.timeout(2500) });
+      S.probeStatus[u] = 'live';
+    } catch {
+      S.probeStatus[u] = 'err';
+    }
+    renderDisList();
+  }
+
+  btn.textContent = '⚡ Probe Live Status';
+  toast('Disallowed endpoints probed!', 'ok');
+}
+
+async function probeSelectedDis() {
+  if (!S.selectedDis.size) return;
+  const urls = Array.from(S.selectedDis);
+  toast(`Probing ${urls.length} selected endpoints...`, 'ok');
+  for (const u of urls) {
+    try {
+      await fetch(u, { mode: 'no-cors', signal: AbortSignal.timeout(2500) });
+      S.probeStatus[u] = 'live';
+    } catch {
+      S.probeStatus[u] = 'err';
+    }
+  }
+  renderDisList();
+  toast('Selected endpoints probed!', 'ok');
+}
+
+async function probeAllSitemapUrls() {
+  const list = S.filteredSmUrls.slice(0, 30);
+  if (!list.length) return;
+
+  const btn = document.getElementById('probeAllSmBtn');
+  btn.textContent = 'Probing...';
+  toast(`Probing first ${list.length} sitemap URLs...`, 'ok');
+
+  for (const u of list) {
+    try {
+      await fetch(u, { mode: 'no-cors', signal: AbortSignal.timeout(2000) });
+      S.probeStatus[u] = 'live';
+    } catch {
+      S.probeStatus[u] = 'err';
+    }
+  }
+
+  btn.textContent = '⚡ Probe Live Status';
+  renderSitemapExplorer();
+  toast('Sitemap URLs probed!', 'ok');
 }
 
 // ── PATRICK STOX STYLE RULE TESTER ──
@@ -528,7 +821,6 @@ function testUrl() {
   let path = input.value.trim();
   if (!path) { toast('Enter a path to test', 'warn'); return; }
 
-  // support full URL or path
   if (/^https?:\/\//i.test(path)) {
     try { path = new URL(path).pathname; } catch {}
   }
@@ -582,7 +874,7 @@ function testBatchUrls() {
       } catch {}
     } else {
       if (!p.startsWith('/')) p = '/' + p;
-      full = S.base + p;
+      full = resolveEndpointUrl(S.base, p);
     }
     const res = checkUrlAgainst(p, agent);
     return { path: p, full, allowed: res.allowed, reason: res.reason };
@@ -640,7 +932,8 @@ function expJSON() {
     scannedAt: new Date().toISOString(),
     robotsTxt: { raw: S.raw },
     rules: S.rules,
-    sitemaps: S.sitemaps
+    sitemaps: S.sitemaps,
+    extractedSitemapUrls: S.extractedUrls
   };
   dl('robotscheck.json', JSON.stringify(d, null, 2), 'application/json');
 }
@@ -649,19 +942,24 @@ function expMD() {
   const dis = S.rules.filter(r => r.type === 'dis');
   let md = `# RobotsCheck Recon Report: ${S.base}\n\n*Timestamp: ${new Date().toLocaleString()}*\n\n## Disallowed Endpoints (${dis.length})\n\n`;
   dis.forEach(d => {
-    const full = S.base + (d.path.startsWith('/') ? d.path : '/' + d.path);
+    const full = resolveEndpointUrl(S.base, d.path);
     md += `- \`${d.path}\` (Agent: \`${d.agent}\`) → [${full}](${full})\n`;
   });
   md += `\n## Sitemaps (${S.sitemaps.length})\n\n`;
   S.sitemaps.forEach(u => md += `- [${u}](${u})\n`);
+  md += `\n## Sitemap Extracted URLs (${S.extractedUrls.length})\n\n`;
+  S.extractedUrls.slice(0, 100).forEach(u => md += `- [${u}](${u})\n`);
   dl('robotscheck.md', md, 'text/markdown');
 }
 
 function expCSV() {
   let c = 'type,agent,path,full_url\n';
   S.rules.forEach(r => {
-    const full = r.type === 'sitemap' ? r.path : S.base + (r.path.startsWith('/') ? r.path : '/' + r.path);
+    const full = r.type === 'sitemap' ? r.path : resolveEndpointUrl(S.base, r.path);
     c += `${r.type},"${r.agent}","${r.path}","${full}"\n`;
+  });
+  S.extractedUrls.forEach(u => {
+    c += `sitemap_url,"*",,"${u}"\n`;
   });
   dl('robotscheck.csv', c, 'text/csv');
 }
@@ -669,9 +967,9 @@ function expCSV() {
 function expTXT() {
   const dis = S.rules.filter(r => r.type === 'dis');
   let t = `# RobotsCheck Recon — ${S.base}\n# Disallowed Endpoints:\n`;
-  dis.forEach(d => t += S.base + (d.path.startsWith('/') ? d.path : '/' + d.path) + '\n');
-  t += `\n# Sitemaps:\n`;
-  S.sitemaps.forEach(u => t += u + '\n');
+  dis.forEach(d => t += resolveEndpointUrl(S.base, d.path) + '\n');
+  t += `\n# Sitemap URLs (${S.extractedUrls.length}):\n`;
+  S.extractedUrls.forEach(u => t += u + '\n');
   dl('robotscheck.txt', t, 'text/plain');
 }
 
@@ -716,12 +1014,12 @@ function copyEl(id) {
 }
 
 function copyT(t) {
-  navigator.clipboard.writeText(t).then(() => toast('Copied!', 'ok'));
+  navigator.clipboard.writeText(t).then(() => toast('Copied URL!', 'ok'));
 }
 
 function copyAllDis() {
   const dis = S.rules.filter(r => r.type === 'dis');
-  const text = dis.map(d => S.base + (d.path.startsWith('/') ? d.path : '/' + d.path)).join('\n');
+  const text = dis.map(d => resolveEndpointUrl(S.base, d.path)).join('\n');
   navigator.clipboard.writeText(text).then(() => toast(`Copied ${dis.length} URLs!`, 'ok'));
 }
 
@@ -741,7 +1039,7 @@ function toast(msg, type = 'ok') {
   }, 3200);
 }
 
-// ── 3D AMBIENT BACKGROUND (Network Nodes) ──
+// ── 3D CANVAS BACKGROUND ──
 (function() {
   const cv = document.getElementById('bg');
   if (!cv) return;
@@ -801,7 +1099,7 @@ function toast(msg, type = 'ok') {
   window.addEventListener('resize', () => { rsz(); init(); });
 })();
 
-// ── 3D HOLOGRAPHIC SPHERE (Interactive Cyberpunk Canvas) ──
+// ── 3D HOLOGRAPHIC SPHERE ──
 (function() {
   const cv = document.getElementById('sphere');
   if (!cv) return;
@@ -833,7 +1131,6 @@ function toast(msg, type = 'ok') {
       return { px: cx + x1 * sc, py: cy + y0 * sc, z: z1, sc };
     }).sort((a, b) => a.z - b.z);
 
-    // Subtle glow
     const g = ctx.createRadialGradient(cx, cy, R * 0.5, cx, cy, R * 1.3);
     g.addColorStop(0, 'rgba(0,245,160,0.06)');
     g.addColorStop(1, 'rgba(0,245,160,0)');
