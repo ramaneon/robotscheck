@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>RobotsCheck — Bug Bounty Recon Tool</title>
+<meta name="description" content="Instant robots.txt + sitemap scanner for bug bounty hunters. Fetch all Disallow paths and open them all in one click."/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Orbitron:wght@700;900&family=Inter:wght@400;500;600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<canvas id="bg"></canvas>
+
+<header class="hdr">
+  <div class="logo">
+    <svg width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" stroke="url(#lg)" stroke-width="2" fill="none"/><polygon points="16,6 26,21 6,21" fill="url(#lg)" opacity=".85"/><circle cx="16" cy="16" r="3.5" fill="#00f5a0"/><defs><linearGradient id="lg" x1="0" y1="0" x2="32" y2="32"><stop offset="0%" stop-color="#00f5a0"/><stop offset="100%" stop-color="#00d9f5"/></linearGradient></defs></svg>
+    <span>Robots<b>Check</b></span>
+  </div>
+  <a href="https://github.com/robotscheck" target="_blank" class="gh-btn">
+    <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0 1 12 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/></svg>
+    GitHub
+  </a>
+</header>
+
+<main>
+  <!-- HERO -->
+  <section class="hero">
+    <canvas id="sphere"></canvas>
+    <div class="hero-text">
+      <div class="badges">
+        <span class="badge g">&#x25CF; Active</span>
+        <span class="badge c">&#x25CF; v2.0</span>
+        <span class="badge o">&#x25CF; Bug Bounty</span>
+      </div>
+      <h1><span class="gr">Robots</span><span class="cy">Check</span><span class="blink">_</span></h1>
+      <p>Paste a domain. Fetch <code>robots.txt</code> &amp; <code>sitemap.xml</code>. See every <code>Disallow</code> path. Open all in one click.</p>
+      <div class="input-box">
+        <svg class="search-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        <input id="inp" type="text" placeholder="e.g. example.com" autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter')go()"/>
+        <button id="scanBtn" onclick="go()">SCAN</button>
+      </div>
+      <div class="quicklinks">
+        <span>Try:</span>
+        <button onclick="qs('bbc.com')">bbc.com</button>
+        <button onclick="qs('reddit.com')">reddit.com</button>
+        <button onclick="qs('github.com')">github.com</button>
+        <button onclick="qs('amazon.com')">amazon.com</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- STATUS BAR -->
+  <div id="statusBar" class="status-bar hidden">
+    <div class="status-inner">
+      <div class="pulse-dot"></div>
+      <span id="statusMsg">Fetching...</span>
+      <div class="prog-wrap"><div id="prog" class="prog-fill"></div></div>
+      <span id="progPct">0%</span>
+    </div>
+  </div>
+
+  <!-- RESULTS -->
+  <section id="results" class="results hidden">
+
+    <!-- SUMMARY STATS -->
+    <div class="stats" id="statsRow"></div>
+
+    <!-- TWO-COL LAYOUT -->
+    <div class="two-col">
+
+      <!-- LEFT: Robots.txt raw + Disallow list -->
+      <div class="col-left">
+
+        <!-- ROBOTS.TXT RAW -->
+        <div class="card" id="rawCard">
+          <div class="card-head">
+            <span class="card-icon">&#x1F916;</span>
+            <h2>robots.txt</h2>
+            <span id="rawBadge" class="badge-pill">&#x2014;</span>
+            <div class="card-acts">
+              <button class="act-btn" onclick="copyEl('rawPre')" title="Copy">&#x1F4CB; Copy</button>
+              <button class="act-btn" onclick="toggleCard('rawBody')">&#x25B4; Hide</button>
+            </div>
+          </div>
+          <div id="rawBody" class="card-body">
+            <pre id="rawPre" class="raw-code"><span class="muted">Run a scan first</span></pre>
+          </div>
+        </div>
+
+        <!-- SITEMAPS -->
+        <div class="card" id="smCard">
+          <div class="card-head">
+            <span class="card-icon">&#x1F5FA;</span>
+            <h2>Sitemaps Found</h2>
+            <span id="smBadge" class="badge-pill">&#x2014;</span>
+            <div class="card-acts">
+              <button class="act-btn" onclick="openAllSitemaps()">&#x1F517; Open All</button>
+              <button class="act-btn" onclick="toggleCard('smBody')">&#x25B4; Hide</button>
+            </div>
+          </div>
+          <div id="smBody" class="card-body">
+            <div id="smList" class="url-list"><span class="muted">No sitemaps yet</span></div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- RIGHT: Disallow paths - MAIN FEATURE -->
+      <div class="col-right">
+        <div class="card highlight-card" id="disCard">
+          <div class="card-head">
+            <span class="card-icon">&#x1F6AB;</span>
+            <h2>Disallowed Paths</h2>
+            <span id="disBadge" class="badge-pill red-pill">&#x2014;</span>
+            <div class="card-acts">
+              <button class="act-btn green-act" id="openAllBtn" onclick="openAll()">&#x1F517; OPEN ALL IN TABS</button>
+              <button class="act-btn" onclick="copyAllDis()">&#x1F4CB; Copy All</button>
+              <button class="act-btn" onclick="toggleCard('disBody')">&#x25B4; Hide</button>
+            </div>
+          </div>
+
+          <!-- USER-AGENT FILTER -->
+          <div id="agentFilter" class="agent-filter hidden">
+            <span class="filter-lbl">Filter by agent:</span>
+            <div id="agentBtns" class="agent-btns"></div>
+          </div>
+
+          <div id="disBody" class="card-body">
+            <div id="disList" class="dis-list"><span class="muted">Run a scan first</span></div>
+          </div>
+
+          <!-- BATCH OPEN CONTROLS -->
+          <div id="batchBar" class="batch-bar hidden">
+            <span id="selCount" class="sel-count">0 selected</span>
+            <button class="act-btn green-act" onclick="openSelected()">&#x1F517; Open Selected</button>
+            <button class="act-btn" onclick="selectAll()">Select All</button>
+            <button class="act-btn" onclick="clearSel()">Clear</button>
+          </div>
+        </div>
+
+        <!-- URL TEST -->
+        <div class="card" id="testCard">
+          <div class="card-head">
+            <span class="card-icon">&#x2705;</span>
+            <h2>Test URL Against Rules</h2>
+          </div>
+          <div class="card-body">
+            <div class="test-row">
+              <input id="testUrl" type="text" placeholder="/your/path/here" class="test-input"/>
+              <select id="testAgent" class="test-select">
+                <option value="*">* (all bots)</option>
+                <option value="Googlebot">Googlebot</option>
+                <option value="Bingbot">Bingbot</option>
+              </select>
+              <button onclick="testUrl()" class="act-btn green-act">Test</button>
+            </div>
+            <div id="testResult" class="test-result hidden"></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- EXPORT BAR -->
+    <div class="export-bar">
+      <button class="exp-btn" onclick="expJSON()">&#x2B07; JSON</button>
+      <button class="exp-btn" onclick="expMD()">&#x2B07; Markdown</button>
+      <button class="exp-btn" onclick="expCSV()">&#x2B07; CSV</button>
+      <button class="exp-btn" onclick="expTXT()">&#x2B07; Plain Text</button>
+      <button class="rescan-btn" onclick="resetUI()">&#x21BB; New Scan</button>
+    </div>
+
+  </section>
+
+</main>
+
+<footer class="ftr">
+  <span>Robots<b>Check</b></span> &middot; For authorized testing only &middot;
+  <a href="https://github.com/robotscheck" target="_blank">GitHub</a>
+</footer>
+
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>
